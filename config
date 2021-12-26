@@ -1,0 +1,8 @@
+#!/bin/bash -e
+
+export REG_DOMAIN=
+export REG_DOMAIN_PORT=
+export REG_USER=
+export REG_USER_PW=
+export REG_CONTAINER_ID=
+export REG_ROOT_DIR=

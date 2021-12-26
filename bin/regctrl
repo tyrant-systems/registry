@@ -1,0 +1,472 @@
+#!/bin/bash
+
+#####################################################
+# wrapper around the docker registry api.           #
+#                                                   #
+# aides in the management of a private registry     #
+#                                                   #
+#####################################################
+
+################################################
+# runtime opts which are disabled by default   #
+#                                              #
+#   REG_TRACE     -> debug tracing             #
+#   REG_VERBOSITY -> verbose curl requests     #
+#                                              #
+################################################
+
+CURL_OPTS=" -sS "
+
+if [[ "${REG_TRACE:-}" != "" ]]; then
+    set -x
+fi
+
+set -euo pipefail
+
+if [[ "${REG_VERBOSITY:-0}" -eq 1 ]]; then
+    CURL_OPTS=" -v "
+elif [[ "${REG_VERBOSITY:-0}" -eq 2 ]]; then
+    CURL_OPTS=" -v --trace "
+fi
+
+#############
+# constants #
+#           #
+#############
+
+SCRIPT_NAME=$(basename $0)
+
+################################################################
+# the config file exports these variables into the environment #
+#                                                              #
+#   REG_DOMAIN                                         #
+#   REG_DOMAIN_PORT                                    #
+#   REG_USER                                           #
+#   REG_USER_PW                                        #
+#   REG_CONTAINER_ID                                   #
+#                                                              #
+################################################################
+
+CONFIG_DIR=~/.registry.rc
+CONFIG_FILE=config
+CONFIG_PATH=${CONFIG_DIR}/${CONFIG_FILE}
+
+###########
+# utility #
+#         #
+###########
+
+log() {
+    logger -s -t "[DOCKER-REGISTRY-CONTROL][${1}]" "$*"
+    return $?
+}
+
+err() {
+    log "ERR" "$*"
+    return 1
+}
+
+info() {
+    log "INFO" "$*"
+    return 0
+}
+
+build_url() {
+    echo " -u ${REG_USER}:${REG_USER_PW} ${REG_DOMAIN}:${REG_DOMAIN_PORT}"
+    return 0
+}
+
+parse_url_protocol() {
+    echo "$(echo '${1:-}' | grep :// | sed -e's,^\(.*://\).*,\1,g')"
+    return 0
+}
+
+parse_current_config_value() {
+    echo "${1}"
+    return 0
+}
+
+parse_current_registry_container_id() {
+    docker ps --format '{{ .Names }} {{ .ID }}' | grep registry | awk '{print $2}'
+    return 0
+}
+
+###############
+# subcommands #
+#             #
+###############
+
+usage() {
+    printf "\n"
+    printf "usage: %s\n" "${1} <subcommand> <args> ..."
+    printf "\n"
+    printf "\t%s\n" "available subcommands are:"
+    printf "\n"
+    printf "\t%s -> %s\n" "catalog" "list all of the images in the registry"
+    printf "\t%s -> %s\n" "configure" "run the registry manager configuration setup"
+    printf "\t%s -> %s\n" "delete <img_name> <img_digest>" "deletes an image from the registry"
+    printf "\t%s -> %s\n" "digest <img_name> <img_tag>" "get image digest"
+    printf "\t%s -> %s\n" "info" "get basic registry information"
+    printf "\t%s -> %s\n" "gc" "force run the registry garbage collection command and exit"
+    printf "\t%s -> %s\n" "help" "prints this message and exits"
+    printf "\t%s -> %s\n" "manifest <img_name> <img_tag>" "get basic manifest information"
+    printf "\t%s -> %s\n" "purge <repo_name>" "delete the image repository (succeeds only if no tags are stored in it)"
+    printf "\t%s -> %s\n" "tags <img_name>" "list the tags for a given image"
+    printf "\n"
+
+    return 0
+}
+
+create_config_for_user() {
+    local config_dir=${1}
+    local config_file=${2}
+    local config_path=${config_dir}/${config_file}
+
+    if [[ ! -d ${config_dir} ]]; then
+        mkdir ${config_dir}
+    fi
+
+    if [[ -e ${config_path} ]]; then
+        # an existing config file was found
+        # so create a backup and delete it when done
+
+        cat ${config_path} >${config_path}.bak.tmp &&
+            trap mv ${config_path}.bak.tmp ${config_path} ERR &&
+            trap rm ${config_path}.bak.tmp RETURN
+    fi
+
+    touch ${config_path}
+
+    local registry_domain
+    local registry_domain_port
+    local registry_user
+    local registry_user_pw
+
+    echo "enter the registry domain:"
+    read registry_domain
+    echo "enter the registry domain port number:"
+    read registry_domain_port
+    echo "enter an authorized registry account username:"
+    read registry_user
+    echo "enter the password for account username \"${registry_user}\":"
+    read registry_user_pw
+
+    local url_proto
+    local registry_container_id
+
+    url_proto=$(parse_url_protocol '${registry_domain}')
+
+    if [[ "${url_proto}" = "" ]]; then
+        registry_domain=https://${registry_domain}
+    fi
+
+    registry_container_id=$(parse_current_registry_container_id)
+
+    if [[ "${registry_container_id}" == "" ]]; then
+        err "unable to find a registry host container"
+    fi
+
+    echo "export REG_DOMAIN=${registry_domain}" >>${config_path}
+    echo "export REG_DOMAIN_PORT=${registry_domain_port}" >>${config_path}
+    echo "export REG_USER=${registry_user}" >>${config_path}
+    echo "export REG_USER_PW=${registry_user_pw}" >>${config_path}
+    echo "export REG_CONTAINER_ID=${registry_container_id:-}" >>${config_path}
+
+    return 0
+}
+
+update_stale_config_for_user() {
+    local config_dir=${1}
+    local config_file=${2}
+    local config_path=${config_dir}/${config_file}
+
+    local current_container_id=$(parse_current_config_value $REG_CONTAINER_ID)
+    local actual_container_id=$(parse_current_registry_container_id)
+
+    if [[ "${current_container_id}" != "${actual_container_id}" ]]; then
+        unset REG_DOMAIN
+        unset REG_DOMAIN_PORT
+        unset REG_USER
+        unset REG_USER_PW
+        unset REG_CONTAINER_ID
+
+        cp ${config_path} ${config_path}.tmp
+        head -n 4 ${config_path}.tmp >${config_path}
+        rm ${config_path}.tmp
+
+        echo "export REG_CONTAINER_ID=${actual_container_id:-}" >>${config_path}
+    fi
+
+    return $?
+}
+
+show_registry_info() {
+    # GET /V2/
+
+    local args=$(build_url)
+    local endpoint=/v2/
+
+    curl ${CURL_OPTS} -X GET \
+        ${args}${endpoint} |
+        jq '.'
+}
+
+list_catalog() {
+    # GET /V2/_catalog
+
+    local args=$(build_url)
+    local endpoint=/v2/_catalog
+
+    curl ${CURL_OPTS} -X GET \
+        ${args}${endpoint} |
+        jq '.'
+
+    return $?
+}
+
+list_image_tags() {
+    # GET /v2/<name>/tags/list
+
+    local img_name=${1}
+
+    local args=$(build_url)
+    local endpoint=/v2/${img_name}/tags/list
+
+    curl ${CURL_OPTS} -X GET \
+        ${args}${endpoint} |
+        jq '.'
+
+    return $?
+}
+
+show_manifest_for_image() {
+    # GET /v2/<name>/manifests/<reference>
+
+    local img_name=${1}
+    local img_tag=${2}
+
+    local args=$(build_url)
+    local endpoint=/v2/${img_name}/manifests/${img_tag}
+
+    curl ${CURL_OPTS} -X GET \
+        ${args}${endpoint} |
+        jq '.'
+
+    return $?
+}
+
+get_image_digest() {
+    # HEAD /v2/<name>/manifests/<reference>
+
+    local img_name=${1}
+    local img_tag=${2}
+
+    local args=$(build_url)
+    local endpoint=/v2/${img_name}/manifests/${img_tag}
+
+    #-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
+    local digest=$(curl ${CURL_OPTS} -X HEAD -I \
+        -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+        ${args}${endpoint} |
+        grep -Fi Docker-Content-Digest |
+        awk '{ print $2 }')
+    #| tr -d '\r')
+    #| grep -i "Docker-Content-Digest"| awk '{print $3}')
+
+    digest=${digest//[$'\t\r\n']/}
+
+    echo "${digest}"
+
+    return $?
+}
+
+delete_image_from_catalog() {
+    # DELETE /v2/<name>/manifest/<reference>
+
+    local img_name=${1}
+    local img_tag=${2}
+    local img_digest=$(get_image_digest $img_name $img_tag)
+
+    printf "are you sure you want to delete %s:%s (%s) " \
+        "${img_name}" \
+        "${img_tag}" \
+        "${img_digest}"
+
+    printf "([Y]es/[N]o) "
+
+    local user_confirmation
+
+    read user_confirmation
+
+    if [[ "${user_confirmation}" = "n" ]] ||
+        [[ "${user_confirmation}" = "no" ]] ||
+        [[ "${user_confirmation}" = "N" ]] ||
+        [[ "${user_confirmation}" = "NO" ]]; then
+        echo "failed to delete image: user said no"
+        return 1
+    fi
+
+    echo
+
+    local args=$(build_url)
+    local endpoint=/v2/${img_name}/manifests/${img_digest}
+
+    local res_code=$(curl ${CURL_OPTS} -X DELETE \
+        -w '%{http_code}' \
+        -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+        ${args}${endpoint})
+
+    local return_code
+
+    if [[ ${res_code} -eq 202 ]]; then
+        return_code=0
+    else
+        return_code=${res_code}
+    fi
+
+    return ${return_code}
+}
+
+remove_repository() {
+    # repo_name is same as img_name
+
+    # TODO: these should NOT be hardcoded
+    REG_BASE_PATH=/mnt/registry
+    REG_COMMON_PATH=/docker/registry/v2/repositories
+
+    local repo_name=${1}
+
+    if list_image_tags ${repo_name} | grep -q null; then
+        echo "no tags attached to image, safe to delete the repository .."
+
+        if docker exec -it ${REG_CONTAINER_ID} ls /var/lib/docker${REG_COMMON_PATH} | grep -q repositories; then
+            if docker exec -it ${REG_CONTAINER_ID} ls /var/lib${REG_COMMON_PATH}/${repo_name} >/dev/null; then
+                echo "repository found in container"
+                docker exec -it ${REG_CONTAINER_ID} rm -rfv /var/lib${REG_COMMON_PATH}/${repo_name}
+            fi
+        else
+            echo "repostiory not found in container"
+
+            if ls ${REG_BASE_PATH}${REG_COMMON_PATH}/${repo_name} >/dev/null; then
+                echo "repository found in local bind mount volume"
+                sudo rm -rfv ${REG_BASE_PATH}${REG_COMMON_PATH}/${repo_name}
+            else
+                echo "repository not found anywhere"
+            fi
+        fi
+    else
+        echo "cannot remove the repository as it still contains tags (or it doesn't exist!)"
+    fi
+}
+
+run_gc() {
+    docker exec -it ${REG_CONTAINER_ID} bin/registry garbage-collect /etc/docker/registry/config.yml
+    return $?
+}
+
+################
+# config check #
+################
+
+if [[ ! -f ${CONFIG_PATH} ]]; then
+    info "configuration file ${CONFIG_PATH} not found"
+    info "running configuration (this can be re-run at any time)"
+
+    create_config_for_user "${CONFIG_DIR}" "${CONFIG_FILE}"
+fi
+
+source ${CONFIG_PATH}
+update_stale_config_for_user "${CONFIG_DIR}" "${CONFIG_FILE}"
+source ${CONFIG_PATH}
+
+#########
+# input #
+#########
+
+subcmd=${1:-""} &&
+    shift
+
+case ${subcmd} in
+catalog)
+    list_catalog
+
+    exit $?
+    ;;
+configure)
+    create_config_for_user \
+        ${CONFIG_DIR} \
+        ${CONFIG_FILE}
+
+    exit $?
+    ;;
+delete)
+    delete_image_from_catalog \
+        ${1} \
+        ${2}
+
+    err_code=$?
+
+    if [[ ${err_code} -eq 0 ]]; then
+        echo "deleted: ${1}:${2} (running garbage collection)"
+        run_gc
+    else
+        err "error deleting ${1}:${2} (${err_code})"
+    fi
+
+    exit $?
+    ;;
+purge)
+    run_gc &&
+        remove_repository \
+            ${1}
+
+    exit $?
+    ;;
+digest)
+    get_image_digest \
+        ${1} \
+        ${2}
+
+    exit $?
+    ;;
+gc)
+    run_gc
+
+    exit $?
+    ;;
+help)
+    usage \
+        ${SCRIPT_NAME}
+
+    exit $?
+    ;;
+info)
+    show_registry_info
+
+    exit $?
+    ;;
+manifest)
+    show_manifest_for_image \
+        ${1} \
+        ${2}
+
+    exit $?
+    ;;
+tags)
+    list_image_tags \
+        ${1}
+
+    exit $?
+    ;;
+*)
+    err_msg="unknown subcommand, \"${subcmd}\""
+
+    if [[ "${subcmd}" = "" ]]; then
+        err_msg="expected at least one argument"
+    fi
+
+    err "${err_msg} (run with \"help\" to see a list of available subcommands)"
+    ;;
+esac
+
+exit $?

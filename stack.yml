@@ -1,0 +1,30 @@
+version: "3.7"
+
+networks:
+  tyrant-mesh:
+    external: true
+
+services:
+  daemon:
+    image: registry:latest
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.registry==true
+    networks:
+      - tyrant-mesh
+    ports:
+      - 5443:5000
+    environment:
+      REGISTRY_HTTP_ADDR: 0.0.0.0:5000
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/fullchain.pem
+      REGISTRY_HTTP_TLS_KEY: /certs/privkey.pem
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - /mnt/registry:/var/lib/registry
+      - ${REG_ROOT_DIR}/local/certs:/certs:ro
+      - ${REG_ROOT_DIR}/local/auth:/auth:ro

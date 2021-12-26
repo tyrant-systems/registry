@@ -1,0 +1,66 @@
+#!/bin/bash -e
+
+echo "Bootstrapping configuration .."
+
+case "$1" in
+h | help | -h | --help)
+    echo "Deploy a self-hosted and private container registry."
+    echo
+    echo "If an expected directory does not exist, this script will"
+    echo "bootstrap it."
+    echo
+    echo "To force bootstrap of the registry rc file pass \"rc\". To force"
+    echo "bootstrap of configuration pass \"config\"."
+    echo
+    echo "Usage:"
+    echo
+    echo "./local/$(basename $0) [registry] [config]"
+
+    exit 1
+    ;;
+esac
+
+declare init_ctrl=1
+declare init_config=1
+
+while (("$#")); do
+    case "$1" in
+    rc) init_ctrl=0 ;;
+    config) init_config=0 ;;
+    esac
+done
+
+if [[ ! -d ~/.registry.rc || $init_ctrl -eq 0 ]]; then
+    echo "Creating rc directories and files now .."
+
+    mkdir -p ~/.registry.rc
+
+    cp config ~/.registry.rc/config
+
+    echo "Created a new rc file under ~/.registry.rc/config"
+    echo "NOTE:"
+    echo "Registry control will _not_ work until:"
+    echo "  - ~/.registry.rc/config is populated with values"
+fi
+
+if [[ ! -d local/ || $init_config -eq 0 ]]; then
+    echo "Creating configuration directories and files now .."
+
+    mkdir -p local/certs
+    mkdir -p local/auth
+
+    touch local/auth/htpasswd
+
+    cp config local/config
+
+    echo "Configuration files are now available under ./local .."
+    echo "NOTE:"
+    echo "Deployment will _not_ work until:"
+    echo "  - Configuration variables are populated"
+    echo "  - Certificates exist under ./local/certs"
+    echo "  - A valid user/password is defined under ./local/auth/htpasswd"
+fi
+
+echo "Done."
+
+exit 0
