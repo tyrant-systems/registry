@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-if [[ -f ./local/config ]]; then
+if [[ ! -f ./local/config ]]; then
     echo "no config file found at ./local/config -- are you sure it exists and are you sure you're executing this script from the repository root?"
     exit 1
 fi
