@@ -26,5 +26,5 @@ services:
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
       - /mnt/registry:/var/lib/registry
-      - ${REG_ROOT_DIR}/local/certs:/certs:ro
-      - ${REG_ROOT_DIR}/local/auth:/auth:ro
+      - $PWD/local/certs:/certs:ro
+      - $PWD/local/auth:/auth:ro
